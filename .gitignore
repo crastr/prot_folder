@@ -2,9 +2,16 @@
 .Rhistory
 .RData
 .vscode
+.quarto/
 renv/library
 renv/python
-data/
-results/
-figures/
-!figures/.gitkeep  # Optional: if you want to track the empty folder but not content
+
+# Keep folder structure tracked while ignoring contents
+data/*
+!data/.gitkeep
+
+results/*
+!results/.gitkeep
+
+figures/*
+!figures/.gitkeep

@@ -22,34 +22,53 @@ execute:
   message: false
 ---
 
-# Introduction & Pipeline Overview
 
-This document provides a modular, self-contained, and reproducible **Proteomics Analysis Pipeline** designed to ingest raw peptide/protein quantification data (e.g., Spectronaut, directLFQ, MaxQuant), perform rigorous univariate and multivariate QC (Inter-Sample Correlation), apply robust feature filtering and normalization, and fit linear models using **limma** and **DEqMS** (accounting for technical replicates and peptide count-based variance shrinkage).
 
-### Key Workflow Steps:
-1. **Pipeline Configuration**: Centralized parameter block to point to any new dataset.
-2. **Metadata & Matrix Ingestion**: Automated column cleaning and sample alignment.
-3. **Quality Control & Diagnostics**:
-   - Sample-level protein identification depth.
-   - Protein-level missingness distributions.
-   - Multivariate QC via **Inter-Sample Correlation (IAC)** to assess sample connectivity and flag outliers ($Z < -3$ MAD).
-4. **Feature Cleaning & Preprocessing**:
-   - Contaminant detection and removal.
-   - Group-wise completeness filtering ($\ge 70\%$ presence).
-5. **Normalization & Missing Value Imputation**:
-   - $Log_2$ transformation and sample-wise median centering.
-   - Sample-minimum imputation for limit-of-detection values.
-6. **Exploratory Data Analysis**:
-   - Principal Component Analysis (PCA) with scree metrics.
-7. **Peptide / Precursor Count Integration**:
-   - Quantified precursor extraction for DEqMS variance weighting.
-8. **Differential Expression Modeling (limma + DEqMS)**:
-   - Consensus technical replicate correlation (`duplicateCorrelation`).
-   - Flexible contrast testing.
-   - Empirical Bayes shrinkage weighted by peptide counts (`spectraCounteBayes`).
-9. **Visualizations & Export**:
-   - Publication-ready Volcano plots.
-   - Multi-tab Excel workbook export with summary metrics and hit tables.
+# Pipeline Overview & Input Data Requirements
+
+This notebook provides an end-to-end, reproducible differential abundance analysis pipeline for label-free quantitative proteomics (DIA/DDA) using **limma** and **DEqMS** (variance shrinkage weighted by quantified peptide/precursor counts).
+
+To run this pipeline on your dataset, place your input files in the `data/` directory and configure the paths and parameters in **Section 1**.
+
+---
+
+### Required Input Files & Format Specifications
+
+#### 1. Protein Quantification Matrix (`FILE_INTENSITY`)
+- **Software Source**: Standard output from mass spectrometry search & quantification platforms such as **Spectronaut** (e.g., Protein Report, `directLFQ` matrix), **DIA-NN** (`report.pg_matrix.tsv` or `pg_matrix.tsv`), **MaxQuant** (`proteinGroups.txt`), or **FragPipe** (`combined_protein.tsv`).
+- **File Format**: Tab-separated (`.tsv`) or comma-separated (`.csv`).
+- **Structure**:
+  - **First Column**: Unique Protein Identifiers (e.g., UniProt Accessions like `P04637`, gene symbols, or protein group IDs).
+  - **Remaining Columns**: Numerical abundance or intensity values (raw or normalized LFQ / MS2 intensities) across runs/samples.
+  - **Zeroes & Missing Data**: Unquantified values or zeroes (`0`) are automatically converted to `NA`.
+  - **Column Headers**: Sample column headers should correspond to the sample identifiers in the metadata table (common prefixes such as `[1] ` or suffixes like `.raw` / `.mzML` are automatically cleaned during ingestion).
+
+#### 2. Sample Metadata Table (`FILE_METADATA`)
+- **File Format**: CSV (`.csv`) or TSV (`.tsv`).
+- **Structure & Columns**:
+  - `Sample_Name`: Unique sample identifiers matching the sample columns in the protein intensity matrix.
+  - **Primary Grouping Column** (e.g., `Group`, `Condition`, `Treatment`): Factor variable indicating the biological condition or experimental group for each sample (e.g. `Control`, `Treated_A`, `Treated_B`). If your experiment has multiple factorial variables (such as genotype and exposure), combine them into a single `Group` column or configure `PARAM_GROUP_COL`.
+  - `Replicate` (Optional): Identifier for biological or technical replicates (e.g., `1`, `2`, `01`, `02`). If technical duplicates or repeated measures are present, configuring `PARAM_BLOCK_COL = "Replicate"` enables `limma::duplicateCorrelation` to model intra-replicate correlation.
+  - **Covariates** (Optional): Additional columns (e.g., `Batch`, `Sex`, `Cohort`) available for cohort subsetting (`PARAM_SUBSET_COL`).
+- **Example Metadata Layout**:
+
+| Sample_Name | Group | Replicate | Batch |
+|:------------|:------|:----------|:------|
+| Sample_01   | WT_Control | Rep1 | 1 |
+| Sample_02   | WT_Control | Rep2 | 1 |
+| Sample_03   | WT_Treated | Rep1 | 1 |
+| Sample_04   | WT_Treated | Rep2 | 1 |
+| Sample_05   | KO_Control | Rep1 | 2 |
+| Sample_06   | KO_Treated | Rep1 | 2 |
+
+#### 3. Peptide / Precursor Count Table (`FILE_PEPTIDES`)
+- **Software Source**: Must be extracted from the **exact same search/quantification run** as the protein intensity matrix (e.g., Spectronaut peptide/precursor summary report, DIA-NN precursor count matrix, or MaxQuant peptide evidence count).
+- **File Format**: Tab-separated (`.tsv`) or comma-separated (`.csv`).
+- **Structure**:
+  - **First Column**: Protein IDs matching those in the protein intensity matrix.
+  - **Remaining Columns**: Number of quantified peptides or precursor ions identified per protein per sample/run.
+- **Role in DEqMS**: `DEqMS` (`spectraCounteBayes`) fits a variance-dependence curve on the number of quantified peptides/precursors. Proteins quantified by many peptides receive stronger variance shrinkage, improving statistical power while controlling false discoveries.
+- **Graceful Fallback**: If a peptide count file is omitted or unavailable, the pipeline defaults to equal weighting (`count = 1`), behaving identically to standard `limma::eBayes`.
 
 ---
 
@@ -87,35 +106,60 @@ dir.create(path_figs, showWarnings = FALSE, recursive = TRUE)
 # ------------------------------------------------------------------------------
 # 2. Input File Paths (Update these for a new dataset)
 # ------------------------------------------------------------------------------
-# Metadata CSV file
+# Metadata CSV/TSV file
 FILE_METADATA <- file.path(path_data, "Proteomics_metadata.csv")
+if (!file.exists(FILE_METADATA)) {
+  cand_meta <- list.files(path_data, pattern = "(metadata|sample.*info).*\\.(csv|tsv)$", ignore.case = TRUE, full.names = TRUE)
+  if (length(cand_meta) > 0) FILE_METADATA <- cand_meta[1]
+}
 
 # Protein intensity matrix (TSV or CSV: proteins in rows, samples in columns)
+# (from Spectronaut, DIA-NN, MaxQuant, or directLFQ)
 FILE_INTENSITY <- file.path(
   path_data, 
   "directlfq_on_cont_data", 
   "20261008_095241_20260618-1447_Report.tsv.protein_intensities.tsv"
 )
-# Fallback search if path changes
 if (!file.exists(FILE_INTENSITY)) {
-  cand <- list.files(file.path(path_data, "directlfq_on_cont_data"), pattern = "protein_intensities\\.tsv$", full.names = TRUE)
-  if (length(cand) > 0) FILE_INTENSITY <- cand[1]
+  cand_int <- list.files(path_data, pattern = "(protein.*intensit|pg_matrix|proteinGroups).*\\.(tsv|csv|txt)$", recursive = TRUE, ignore.case = TRUE, full.names = TRUE)
+  if (length(cand_int) > 0) FILE_INTENSITY <- cand_int[1]
 }
 
-# Spectronaut peptide / precursor count file (for DEqMS variance modeling)
+# Peptide / precursor count file (from the same Spectronaut/DIA-NN run for DEqMS variance modeling)
+# (Set to NULL if not available; DEqMS will gracefully fall back to equal weighting)
 FILE_PEPTIDES <- file.path(path_data, "20260926_221340_20260618-1447_Report_peptide_numbers.tsv")
 if (!file.exists(FILE_PEPTIDES)) {
-  FILE_PEPTIDES <- file.path(path_data, "20260812_050914_20260618-1447_Report_pept_numbers.tsv")
+  cand_pep <- list.files(path_data, pattern = "(peptide.*numbers|pept.*numbers|precursor.*count).*\\.(tsv|csv|txt)$", recursive = TRUE, ignore.case = TRUE, full.names = TRUE)
+  if (length(cand_pep) > 0) {
+    FILE_PEPTIDES <- cand_pep[1]
+  } else {
+    FILE_PEPTIDES <- NULL
+  }
 }
 
 # ------------------------------------------------------------------------------
 # 3. Analysis Parameters & Filters
 # ------------------------------------------------------------------------------
-PARAM_SUBSET_SEX          <- "Female"   # Set to "Female", "Male", or NULL to include all
+# Metadata column mappings
+PARAM_SAMPLE_ID_COL       <- "Sample_Name" # Column matching sample columns in intensity matrix
+PARAM_GROUP_COL           <- "Group"       # Primary factor column defining experimental conditions (e.g. "Group", "Condition")
+PARAM_BLOCK_COL           <- NULL          # Optional blocking factor for paired/duplicate correlation (e.g. "Replicate", or NULL)
+
+# Optional cohort subsetting (set to a column name and value, or leave NULL to include all samples)
+PARAM_SUBSET_COL          <- NULL          # e.g., "Sex", "Cohort", or NULL
+PARAM_SUBSET_VAL          <- NULL          # e.g., "Female", or NULL
+
+# Contrasts to test (leave NULL to auto-generate all pairwise comparisons between group levels)
+PARAM_CONTRASTS           <- NULL          # e.g., c("Treated - Control") or NULL
+
+# Quality control & filtering parameters
+PARAM_APPLY_SAMPLE_FILTER <- TRUE       # Drop samples failing QC (set FALSE to inspect without dropping)
+PARAM_MAX_MISSING_RATE    <- 0.50       # Tier 1: Drop samples with > 50% missing proteins
+PARAM_MAD_CUTOFF          <- 3.0        # Tier 1: ID count and sum intensity cutoff (median - 3*MAD)
+PARAM_IAC_MAD_CUTOFF      <- 3.0        # Tier 2: Multivariate IAC cutoff (-3 MAD below median IAC)
 PARAM_MIN_COMPLETENESS    <- 0.70       # Require protein present in >= 70% in at least 1 group
 PARAM_FILTER_CONTAMINANTS <- TRUE       # Remove contaminants matching regex
 PARAM_CONTAMINANT_REGEX   <- "^Cont|^CON__"
-PARAM_IAC_MAD_CUTOFF      <- 3.0        # Multivariate QC cutoff (-3 MAD below cohort median IAC)
 PARAM_NORM_METHOD         <- "medianCentering" # "medianCentering" or "none"
 PARAM_IMPUTE_METHOD       <- "sample_minimum"  # "sample_minimum" or "none"
 
@@ -123,9 +167,9 @@ PARAM_IMPUTE_METHOD       <- "sample_minimum"  # "sample_minimum" or "none"
 FILE_OUTPUT_XLSX <- file.path(path_results, "Proteomics_DEqMS_Analysis_Results.xlsx")
 
 cat("Configuration successfully initialized.\n")
-cat(sprintf("Intensity Matrix: %s\n", basename(FILE_INTENSITY)))
-cat(sprintf("Metadata File:    %s\n", basename(FILE_METADATA)))
-cat(sprintf("Peptide File:     %s\n", basename(FILE_PEPTIDES)))
+cat(sprintf("Intensity Matrix: %s\n", if (!is.null(FILE_INTENSITY)) basename(FILE_INTENSITY) else "Not found"))
+cat(sprintf("Metadata File:    %s\n", if (!is.null(FILE_METADATA)) basename(FILE_METADATA) else "Not found"))
+cat(sprintf("Peptide File:     %s\n", if (!is.null(FILE_PEPTIDES)) basename(FILE_PEPTIDES) else "None (limma eBayes fallback)"))
 ```
 
 ---
@@ -135,50 +179,59 @@ cat(sprintf("Peptide File:     %s\n", basename(FILE_PEPTIDES)))
 ```{r}
 #| label: ingest-metadata
 
-meta_raw <- read.table(FILE_METADATA, sep = ",", header = TRUE, stringsAsFactors = FALSE)
+# Determine file delimiter and load metadata
+meta_delim <- if (grepl("\\.tsv$", FILE_METADATA, ignore.case = TRUE)) "\t" else ","
+meta_raw <- read.table(FILE_METADATA, sep = meta_delim, header = TRUE, check.names = FALSE, stringsAsFactors = FALSE)
 
-# Clean sample names and ensure replicate identifiers
-meta_clean <- meta_raw %>%
-  mutate(
-    Mutation  = factor(Mutation, levels = c("WT", "AD")),
-    Treatment = factor(Treatment, levels = c("CTRL", "UFP", "AN", "UFP_AN")),
-    Sex       = factor(Sex, levels = c("Female", "Male")),
-    Sample_Clean = sub("_[0-9]+$", "", Sample_Name)
-  )
-
-# If technical duplicates (_01, _02) are not yet expanded, ensure 2 entries per biological sample
-if (!any(grepl("_[0-9]+$", meta_clean$Sample_Name))) {
-  rep1 <- meta_clean %>% mutate(Sample_Name = paste0(Sample_Clean, "_01"), Replicate = "01")
-  rep2 <- meta_clean %>% mutate(Sample_Name = paste0(Sample_Clean, "_02"), Replicate = "02")
-  meta_clean <- bind_rows(rep1, rep2) %>% arrange(Sample_Name)
-} else {
-  meta_clean <- meta_clean %>%
-    mutate(Replicate = sub(".*_([0-9]+)$", "\\1", Sample_Name))
+# Ensure sample identifier column exists
+if (!PARAM_SAMPLE_ID_COL %in% colnames(meta_raw)) {
+  PARAM_SAMPLE_ID_COL <- colnames(meta_raw)[1]
+  warning(sprintf("Configured sample ID column not found. Defaulting to first column: '%s'", PARAM_SAMPLE_ID_COL))
 }
 
-# Construct Combined Group Factor
-meta_clean <- meta_clean %>%
+# Standardize Sample_Name and convert character metadata columns to factors
+meta_clean <- meta_raw %>%
   mutate(
-    Combined_treatment = factor(
-      paste(Sex, Mutation, Treatment, sep = "_")
-    )
+    Sample_Name = as.character(.data[[PARAM_SAMPLE_ID_COL]]),
+    across(where(is.character), as.factor)
   )
 
-# Apply optional cohort filter (e.g. Female only)
-if (!is.null(PARAM_SUBSET_SEX)) {
-  meta_active <- meta_clean %>%
-    filter(Sex == PARAM_SUBSET_SEX) %>%
-    droplevels()
+# Define Primary Experimental Group Factor
+if (PARAM_GROUP_COL %in% colnames(meta_clean)) {
+  meta_clean$Group <- factor(meta_clean[[PARAM_GROUP_COL]])
+} else {
+  stop(sprintf("Primary group column '%s' not found in metadata. Available columns: %s\nPlease update PARAM_GROUP_COL in Section 1 to match your metadata grouping column.",
+               PARAM_GROUP_COL, paste(colnames(meta_clean), collapse = ", ")))
+}
+
+# Apply optional cohort filter (e.g. subset by Sex or Cohort)
+if (!is.null(PARAM_SUBSET_COL) && !is.null(PARAM_SUBSET_VAL)) {
+  if (PARAM_SUBSET_COL %in% colnames(meta_clean)) {
+    meta_active <- meta_clean %>%
+      filter(.data[[PARAM_SUBSET_COL]] == PARAM_SUBSET_VAL) %>%
+      droplevels()
+    cat(sprintf("Cohort filtered on %s == '%s': %d samples retained.\n", 
+                PARAM_SUBSET_COL, PARAM_SUBSET_VAL, nrow(meta_active)))
+  } else {
+    warning(sprintf("Subset column '%s' not found. Retaining all samples.", PARAM_SUBSET_COL))
+    meta_active <- meta_clean
+  }
 } else {
   meta_active <- meta_clean
 }
 
-cat(sprintf("Loaded metadata for %d active samples across %d experimental groups:\n", 
-            nrow(meta_active), nlevels(meta_active$Combined_treatment)))
+cat(sprintf("Loaded metadata for %d active samples across %d experimental groups (%s):\n", 
+            nrow(meta_active), nlevels(meta_active$Group), paste(levels(meta_active$Group), collapse = ", ")))
 
-table_summary <- meta_active %>%
-  dplyr::count(Mutation, Treatment, Replicate) %>%
-  tidyr::pivot_wider(names_from = Treatment, values_from = n, values_fill = 0)
+# Cohort summary table
+if (!is.null(PARAM_BLOCK_COL) && PARAM_BLOCK_COL %in% colnames(meta_active)) {
+  table_summary <- meta_active %>%
+    dplyr::count(Group, .data[[PARAM_BLOCK_COL]]) %>%
+    tidyr::pivot_wider(names_from = Group, values_from = n, values_fill = 0)
+} else {
+  table_summary <- meta_active %>%
+    dplyr::count(Group)
+}
 print(table_summary)
 ```
 
@@ -198,11 +251,12 @@ protein_identifiers <- df_intensities[[prot_id_col]]
 mat_raw <- as.matrix(df_intensities[, -1, drop = FALSE])
 rownames(mat_raw) <- protein_identifiers
 
-# Clean Spectronaut / directLFQ column headers to match Sample_Name (e.g., F001_01)
+# Clean Spectronaut / DIA-NN / MaxQuant column headers to match Sample_Name
+# Strips run prefixes (e.g. "[1] "), file extensions (.raw, .mzML, .d), and optional project prefixes
 colnames(mat_raw) <- colnames(mat_raw) |>
-  sub(pattern = ".*ASK_", replacement = "") |>
-  sub(pattern = "\\.raw.*", replacement = "") |>
-  sub(pattern = "^\\[[0-9]+\\]\\s*", replacement = "")
+  sub(pattern = "^\\[[0-9]+\\]\\s*", replacement = "") |>
+  sub(pattern = "\\.(raw|mzML|d).*", replacement = "") |>
+  sub(pattern = ".*ASK_", replacement = "")
 
 # Convert zeros to NAs (unquantified)
 mat_raw[mat_raw == 0] <- NA
@@ -213,6 +267,10 @@ cat(sprintf("Aligned %d samples between metadata and intensity matrix (out of %d
             length(matched_samples), nrow(meta_active)))
 
 if (length(matched_samples) == 0) {
+  cat("\nMetadata Sample_Names (first 5):\n")
+  print(head(meta_active$Sample_Name, 5))
+  cat("\nIntensity Matrix Column Names (first 5):\n")
+  print(head(colnames(mat_raw), 5))
   stop("Zero sample IDs matched between metadata and quantification matrix. Please verify column naming.")
 }
 
@@ -225,135 +283,337 @@ cat(sprintf("Input matrix dimensions: %d proteins x %d samples.\n", nrow(mat_act
 
 ---
 
-# 4. Quality Control & Diagnostics
+---
 
-## Protein Identification Depth per Sample
+# 4. Quality Control & Sample Filtering
+
+We perform automated, multi-tiered sample quality control using **`filter_proteomics_samples()`**:
+
+1. **Tier 1 (Univariate Metrics)**:
+   - **Protein Identification Yield**: Flags samples with ID counts $< \text{Median} - 3 \times \text{MAD}$.
+   - **Sample-Level Missingness**: Flags samples with $> 50\%$ missing proteins (`max_missing_rate = 0.50`).
+   - **Total Signal Intensity**: Flags samples with $\log_2$ total intensity $< \text{Median} - 3 \times \text{MAD}$.
+2. **Tier 2 (Multivariate QC via Inter-Sample Correlation)**:
+   - On retained Tier 1 samples, features present in $\ge 70\%$ of samples (`min_feature_completeness = 0.70`) are selected.
+   - Pairwise Pearson correlation ($r_{ij}$) across samples is calculated.
+   - Mean connectivity $\bar{r}_i$ and robust Z-score $Z_i = \frac{\bar{r}_i - \text{median}}{\text{MAD}}$ are evaluated.
+   - Samples with $Z_i < -3$ MADs below the median are flagged as `"Discard (Correlation Outlier)"`.
 
 ```{r}
-#| label: fig-sample-identification-depth
-#| fig-cap: "Identified proteins (non-NA) per sample across experimental groups"
-#| fig-width: 12
-#| fig-height: 5
+#| label: filter-proteomics-samples-definition
 
-sample_ids <- colSums(!is.na(mat_active))
-
-df_sample_qc <- tibble(
-  Sample_Name = names(sample_ids),
-  Identified_Proteins = sample_ids
-) %>%
-  left_join(meta_active, by = "Sample_Name") %>%
-  arrange(desc(Identified_Proteins))
-
-p_ids <- ggplot(df_sample_qc, aes(x = reorder(Sample_Name, -Identified_Proteins), 
-                                  y = Identified_Proteins, fill = Combined_treatment)) +
-  geom_col(color = "black", linewidth = 0.2) +
-  geom_hline(yintercept = median(sample_ids), linetype = "dashed", color = "firebrick", linewidth = 0.8) +
-  theme_minimal(base_size = 11) +
-  theme(
-    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 7),
-    panel.grid.major.x = element_blank(),
-    legend.position = "top"
-  ) +
-  labs(
-    title = "Protein Identification Depth per Sample",
-    subtitle = sprintf("Cohort median = %s proteins (dashed line)", scales::comma(median(sample_ids))),
-    x = "Sample ID",
-    y = "Identified Proteins (Non-NA)",
-    fill = "Experimental Group"
+# ------------------------------------------------------------------------------
+# 1. filter_proteomics_samples() Definition
+# ------------------------------------------------------------------------------
+filter_proteomics_samples <- function(
+    mat, 
+    group = NULL, 
+    mad_cutoff = 3, 
+    max_missing_rate = 0.50,
+    iac_sd_cutoff = 3,           # Exclude if connectivity is > 3 MADs below median
+    min_feature_completeness = 0.70
+) {
+  sample_names <- colnames(mat)
+  n_samples <- length(sample_names)
+  
+  if (is.null(group)) {
+    group <- factor(rep("All", n_samples))
+  } else {
+    group <- factor(group)
+  }
+  
+  # ---------------------------------------------------------
+  # Step 1: Univariate Metrics
+  # ---------------------------------------------------------
+  id_counts <- colSums(!is.na(mat))
+  missing_rate <- colMeans(is.na(mat))
+  
+  is_log <- max(mat, na.rm = TRUE) < 100
+  if (is_log) {
+    sum_intensity <- colSums(2^mat, na.rm = TRUE)
+  } else {
+    sum_intensity <- colSums(mat, na.rm = TRUE)
+  }
+  
+  med_id <- median(id_counts)
+  mad_id <- mad(id_counts, constant = 1.4826)
+  id_threshold <- med_id - (mad_cutoff * mad_id)
+  
+  log_sum <- log2(pmax(sum_intensity, 1))
+  finite_log_sum <- log_sum[is.finite(log_sum)]
+  med_sum <- median(finite_log_sum)
+  mad_sum <- mad(finite_log_sum, constant = 1.4826)
+  sum_threshold <- med_sum - (mad_cutoff * mad_sum)
+  
+  tier1_flags <- tibble(
+    sample_id = sample_names,
+    group = group,
+    id_count = id_counts,
+    missing_rate = missing_rate,
+    sum_intensity = sum_intensity,
+    fail_id_mad = id_counts < id_threshold,
+    fail_hard_missing = missing_rate > max_missing_rate,
+    fail_intensity_mad = coalesce(log_sum < sum_threshold, FALSE)
+  ) %>%
+    mutate(tier1_drop = fail_id_mad | fail_hard_missing | fail_intensity_mad)
+  
+  retained_t1 <- tier1_flags %>% filter(!tier1_drop) %>% pull(sample_id)
+  dropped_t1 <- tier1_flags %>% filter(tier1_drop) %>% pull(sample_id)
+  
+  # ---------------------------------------------------------
+  # Step 2: Multivariate QC via Inter-Sample Correlation (IAC)
+  # ---------------------------------------------------------
+  tier2_flags <- tibble(
+    sample_id = sample_names,
+    mean_iac = NA_real_,
+    iac_zscore = NA_real_,
+    fail_iac = FALSE
   )
+  
+  med_iac <- NA_real_
+  mad_iac <- NA_real_
+  threshold_iac <- NA_real_
+  
+  if (length(retained_t1) >= 5) {
+    sub_mat <- mat[, retained_t1, drop = FALSE]
+    if (!is_log) {
+      sub_mat <- log2(sub_mat + 1)
+    }
+    
+    # Filter for proteins present across sufficient samples
+    feature_present <- rowMeans(!is.na(sub_mat)) >= min_feature_completeness
+    iac_input <- sub_mat[feature_present, , drop = FALSE]
+    
+    # Pairwise complete Pearson correlation matrix
+    cor_mat <- cor(iac_input, use = "pairwise.complete.obs", method = "pearson")
+    
+    # Mean correlation of each sample to all other retained samples (excluding self)
+    diag(cor_mat) <- NA
+    mean_cor <- colMeans(cor_mat, na.rm = TRUE)
+    
+    # Robust Z-score of connectivity using median and MAD
+    med_iac <- median(mean_cor, na.rm = TRUE)
+    mad_iac <- mad(mean_cor, constant = 1.4826, na.rm = TRUE)
+    threshold_iac <- med_iac - (iac_sd_cutoff * mad_iac)
+    iac_z <- (mean_cor - med_iac) / mad_iac
+    
+    iac_df <- tibble(
+      sample_id = names(mean_cor),
+      mean_iac = mean_cor,
+      iac_zscore = iac_z,
+      fail_iac = iac_z < -iac_sd_cutoff
+    )
+    
+    tier2_flags <- tier2_flags %>%
+      rows_update(iac_df, by = "sample_id")
+  }
+  
+  # ---------------------------------------------------------
+  # Summary & Decision Reporting
+  # ---------------------------------------------------------
+  qc_summary <- tier1_flags %>%
+    left_join(tier2_flags, by = "sample_id") %>%
+    mutate(
+      decision = case_when(
+        tier1_drop ~ "Discard (Low Yield/Missingness)",
+        fail_iac ~ "Discard (Correlation Outlier)",
+        TRUE ~ "Keep for Imputation"
+      )
+    )
+  
+  final_keep <- qc_summary %>% filter(decision == "Keep for Imputation") %>% pull(sample_id)
+  final_discard <- qc_summary %>% filter(decision != "Keep for Imputation") %>% pull(sample_id)
+  
+  cat("================ QC FILTER REPORT ================\n")
+  cat(sprintf("Total input samples: %d\n", n_samples))
+  cat(sprintf("Tier 1 cutoffs: Min IDs = %.0f, Max Missing = %.1f%%, Intensity lower log2 = %.2f\n", 
+              id_threshold, max_missing_rate * 100, sum_threshold))
+  cat(sprintf("Tier 1 removed: %d samples\n", length(dropped_t1)))
+  cat(sprintf("Tier 2 removed (IAC Outliers < -%.1f MAD): %d samples\n", iac_sd_cutoff, sum(qc_summary$fail_iac, na.rm = TRUE)))
+  cat(sprintf("Final retained samples: %d | Final discarded: %d\n", length(final_keep), length(final_discard)))
+  cat("==================================================\n\n")
+  
+  return(list(
+    qc_table = qc_summary,
+    filtered_matrix = mat[, final_keep, drop = FALSE],
+    retained_samples = final_keep,
+    discarded_samples = final_discard,
+    id_threshold = id_threshold,
+    sum_threshold = sum_threshold,
+    med_iac = med_iac,
+    mad_iac = mad_iac,
+    iac_threshold = threshold_iac
+  ))
+}
 
-print(p_ids)
+# ------------------------------------------------------------------------------
+# 2. Execute QC on Input Matrix
+# ------------------------------------------------------------------------------
+qc_res <- filter_proteomics_samples(
+  mat = mat_active,
+  group = meta_active$Group,
+  mad_cutoff = PARAM_MAD_CUTOFF,
+  max_missing_rate = PARAM_MAX_MISSING_RATE,
+  iac_sd_cutoff = PARAM_IAC_MAD_CUTOFF,
+  min_feature_completeness = PARAM_MIN_COMPLETENESS
+)
+
+# ------------------------------------------------------------------------------
+# 3. Apply Decision to Downstream Pipeline
+# ------------------------------------------------------------------------------
+if (PARAM_APPLY_SAMPLE_FILTER) {
+  mat_qc  <- qc_res$filtered_matrix
+  meta_qc <- meta_active %>% filter(Sample_Name %in% qc_res$retained_samples) %>% droplevels()
+  cat(sprintf("Active analysis cohort: %d samples retained (%d discarded).\n", 
+              ncol(mat_qc), length(qc_res$discarded_samples)))
+} else {
+  mat_qc  <- mat_active
+  meta_qc <- meta_active
+  cat(sprintf("PARAM_APPLY_SAMPLE_FILTER is FALSE: Retaining all %d samples for downstream steps.\n", 
+              ncol(mat_qc)))
+}
 ```
 
-## Missingness Distribution Across Proteins
+## Figure: Sample Log2 Intensity Distributions (Boxplot QC)
+
+We plot the intensity distribution of every sample, ordered by its median $\log_2$ intensity, highlighting samples retained for imputation versus those flagged for removal:
 
 ```{r}
-#| label: fig-protein-missingness
-#| fig-cap: "Histogram of missing sample counts across all proteins"
-#| fig-width: 9
-#| fig-height: 4.5
-
-na_counts <- rowSums(is.na(mat_active))
-df_na <- tibble(NA_Count = na_counts)
-
-p_na_hist <- ggplot(df_na, aes(x = NA_Count)) +
-  geom_bar(fill = "#2B83BA", color = "black", linewidth = 0.2) +
-  theme_minimal(base_size = 11) +
-  labs(
-    title = "Missingness Distribution Across Proteins",
-    subtitle = sprintf("Total proteins: %d | Total samples: %d", nrow(mat_active), ncol(mat_active)),
-    x = "Number of Missing Samples (out of total)",
-    y = "Protein Count"
-  )
-
-print(p_na_hist)
-```
-
-## Multivariate QC: Inter-Sample Correlation (IAC)
-
-Following the multivariate QC framework from `analysis.qmd` (Step 2 of sample filtering):
-- Features with $\ge 70\%$ presence are used to calculate the pairwise Pearson correlation matrix ($r_{ij}$).
-- Each sample's mean connectivity $\bar{r}_i$ to the cohort is evaluated:
-  $$\bar{r}_i = \frac{1}{N - 1} \sum_{j \neq i} r_{ij}$$
-- Robust Z-scores are computed using median and MAD:
-  $$Z_i = \frac{\bar{r}_i - \text{median}(\bar{r})}{\text{MAD}(\bar{r})}$$
-- Samples falling below $Z < -3$ MADs are flagged as correlation outliers.
-
-```{r}
-#| label: fig-multivariate-iac-qc
-#| fig-cap: "Sample connectivity (Inter-Sample Correlation) and outlier detection"
-#| fig-width: 11
+#| label: fig-qc-intensity-boxplots
+#| fig-cap: "Sample Log2 intensity distributions ordered by median intensity, color-coded by QC decision"
+#| fig-width: 14
 #| fig-height: 7
 
-# Ensure log2 scale for correlation calculation
-mat_iac_log <- if (max(mat_active, na.rm = TRUE) > 100) log2(mat_active + 1) else mat_active
+plot_proteomics_qc_boxplots <- function(
+    mat, 
+    qc_res, 
+    highlight_samples = c(), 
+    highlight_label = "Flagged / Inspected"
+) {
+  is_log <- max(mat, na.rm = TRUE) < 100
+  plot_mat <- if (is_log) mat else log2(mat + 1)
+  
+  status_map <- qc_res$qc_table %>% dplyr::select(sample_id, decision)
+  
+  plot_df <- as.data.frame(plot_mat) %>%
+    rownames_to_column(var = "protein_id") %>%
+    pivot_longer(cols = -protein_id, names_to = "sample_id", values_to = "log2_intensity") %>%
+    filter(!is.na(log2_intensity)) %>%
+    left_join(status_map, by = "sample_id") %>%
+    mutate(
+      display_status = case_when(
+        sample_id %in% highlight_samples ~ highlight_label,
+        decision != "Keep for Imputation" ~ "Discarded (QC Fail)",
+        TRUE ~ "Retained"
+      ),
+      is_highlighted = sample_id %in% highlight_samples,
+      sample_id = reorder(sample_id, log2_intensity, FUN = median)
+    )
+  
+  fill_palette <- c(
+    "Retained" = "#94A3B8",
+    "Discarded (QC Fail)" = "#F87171"
+  )
+  fill_palette[highlight_label] <- "#F59E0B"
+  
+  ggplot(plot_df, aes(x = sample_id, y = log2_intensity)) +
+    geom_boxplot(
+      aes(fill = display_status, color = is_highlighted, linewidth = is_highlighted),
+      outlier.size = 0.35, outlier.alpha = 0.15, notch = FALSE
+    ) +
+    scale_fill_manual(values = fill_palette, name = "QC Category") +
+    scale_color_manual(values = c("FALSE" = "#334155", "TRUE" = "#000000"), guide = "none") +
+    scale_linewidth_manual(values = c("FALSE" = 0.25, "TRUE" = 0.8), guide = "none") +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x = element_text(
+        angle = 90, hjust = 1, vjust = 0.5, 
+        size = if (ncol(mat) > 80) 5.5 else 8
+      ),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position = "top"
+    ) +
+    labs(
+      title = "Sample Log2 Intensity Distributions",
+      subtitle = sprintf("Total: %d | Retained: %d | Discarded: %d", 
+                         ncol(mat), length(qc_res$retained_samples), length(qc_res$discarded_samples)),
+      x = "Sample (Ordered by Median Log2 Intensity)",
+      y = expression(Log[2]~Intensity)
+    )
+}
 
-# Filter for proteins present across sufficient samples
-feature_present <- rowMeans(!is.na(mat_iac_log)) >= PARAM_MIN_COMPLETENESS
-if (sum(feature_present) < 50) feature_present <- rowMeans(!is.na(mat_iac_log)) >= 0.50
-mat_iac_probe <- mat_iac_log[feature_present, , drop = FALSE]
+print(plot_proteomics_qc_boxplots(mat = mat_active, qc_res = qc_res))
+```
 
-# Pairwise Pearson correlation matrix
-cor_mat <- cor(mat_iac_probe, use = "pairwise.complete.obs", method = "pearson")
-diag(cor_mat) <- NA
-mean_iac <- colMeans(cor_mat, na.rm = TRUE)
+## Figure: Multivariate QC via Inter-Sample Correlation (IAC)
 
-# Robust Z-score
-med_iac       <- median(mean_iac, na.rm = TRUE)
-mad_iac       <- mad(mean_iac, constant = 1.4826, na.rm = TRUE)
-threshold_iac <- med_iac - (PARAM_IAC_MAD_CUTOFF * mad_iac)
-iac_z         <- (mean_iac - med_iac) / mad_iac
+Each sample's connectivity (mean pairwise Pearson correlation to all other retained samples) is ranked and plotted against the cohort median and the $-3$ MAD outlier cutoff:
 
-df_iac <- tibble(
-  Sample_Name   = names(mean_iac),
-  Mean_IAC      = mean_iac,
-  IAC_Zscore    = iac_z,
-  Fail_IAC      = iac_z < -PARAM_IAC_MAD_CUTOFF,
-  Decision      = if_else(iac_z < -PARAM_IAC_MAD_CUTOFF, "Discard (Correlation Outlier)", "Keep for Imputation")
-) %>%
-  left_join(meta_active, by = "Sample_Name")
+```{r}
+#| label: fig-iac-connectivity-dotplot
+#| fig-cap: "Sample connectivity (Mean Inter-Sample Correlation) with -3 MAD outlier cutoff"
+#| fig-width: 10
+#| fig-height: 8
 
-cat(sprintf("Multivariate IAC Summary: %d probe features used | Median IAC = %.4f | Outliers (< -%.1f MAD): %d\n",
-            nrow(mat_iac_probe), med_iac, PARAM_IAC_MAD_CUTOFF, sum(df_iac$Fail_IAC)))
-
-# Connectivity Dot Plot
-p_iac <- ggplot(df_iac, aes(x = reorder(Sample_Name, Mean_IAC), y = Mean_IAC, color = Decision)) +
+p_iac_dot <- ggplot(qc_res$qc_table %>% filter(!is.na(mean_iac)), 
+       aes(x = reorder(sample_id, mean_iac), y = mean_iac, color = decision)) +
   geom_point(size = 2.2) +
-  geom_hline(yintercept = med_iac, linetype = "dashed", color = "grey30", linewidth = 0.8) +
-  geom_hline(yintercept = threshold_iac, linetype = "dotted", color = "#D62728", linewidth = 0.8) +
+  geom_hline(yintercept = qc_res$med_iac, linetype = "dashed", color = "grey30", linewidth = 0.8) +
+  geom_hline(yintercept = qc_res$iac_threshold, linetype = "dotted", color = "#D62728", linewidth = 0.8) +
   scale_color_manual(values = c("Keep for Imputation" = "#2CA02C", "Discard (Correlation Outlier)" = "#D62728")) +
   coord_flip() +
-  theme_bw(base_size = 9) +
-  theme(axis.text.y = element_text(size = 6.5), legend.position = "top") +
+  theme_bw(base_size = 9.5) +
+  theme(axis.text.y = element_text(size = 6), legend.position = "top") +
   labs(
     title = "Sample Connectivity (Mean Inter-Sample Correlation)",
-    subtitle = sprintf("Dashed = Median (%.3f) | Dotted = -%.1f MAD Threshold (%.3f)", med_iac, PARAM_IAC_MAD_CUTOFF, threshold_iac),
+    subtitle = sprintf("Dashed: Median = %.3f | Dotted: -%.1f MAD Cutoff = %.3f | Outliers: %d", 
+                       qc_res$med_iac, PARAM_IAC_MAD_CUTOFF, qc_res$iac_threshold, sum(qc_res$qc_table$fail_iac)),
     x = "Sample ID",
     y = "Mean Pairwise Pearson r",
     color = "QC Decision"
   )
 
-print(p_iac)
+print(p_iac_dot)
+```
+
+## Figure: Univariate Metrics (Protein Yield & Missingness Rate)
+
+```{r}
+#| label: fig-univariate-qc-summary
+#| fig-cap: "Tier 1 univariate QC metrics: protein identification count and missingness rate per sample"
+#| fig-width: 13
+#| fig-height: 5
+
+p_u1 <- ggplot(qc_res$qc_table, aes(x = reorder(sample_id, -id_count), y = id_count, fill = decision)) +
+  geom_col(width = 0.7, color = "black", linewidth = 0.2) +
+  geom_hline(yintercept = qc_res$id_threshold, linetype = "dashed", color = "red", linewidth = 0.8) +
+  scale_fill_manual(values = c("Keep for Imputation" = "#2B83BA", 
+                               "Discard (Low Yield/Missingness)" = "#D7191C", 
+                               "Discard (Correlation Outlier)" = "#FDAE61")) +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 6), legend.position = "none") +
+  labs(
+    title = "Protein Identification Counts",
+    subtitle = sprintf("Dashed line = ID Cutoff (%.0f)", qc_res$id_threshold),
+    x = "Sample", y = "Identified Proteins (Non-NA)"
+  )
+
+p_u2 <- ggplot(qc_res$qc_table, aes(x = reorder(sample_id, missing_rate), y = missing_rate * 100, fill = decision)) +
+  geom_col(width = 0.7, color = "black", linewidth = 0.2) +
+  geom_hline(yintercept = PARAM_MAX_MISSING_RATE * 100, linetype = "dashed", color = "red", linewidth = 0.8) +
+  scale_fill_manual(values = c("Keep for Imputation" = "#2B83BA", 
+                               "Discard (Low Yield/Missingness)" = "#D7191C", 
+                               "Discard (Correlation Outlier)" = "#FDAE61")) +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 6), legend.position = "top") +
+  labs(
+    title = "Sample Missingness Rate (%)",
+    subtitle = sprintf("Dashed line = Max Missingness Cutoff (%.0f%%)", PARAM_MAX_MISSING_RATE * 100),
+    x = "Sample", y = "% Missing Proteins", fill = "QC Decision"
+  )
+
+p_u1 + p_u2
 ```
 
 ---
@@ -365,7 +625,7 @@ print(p_iac)
 
 # 1. Group-wise Completeness Filtering
 # Keep proteins detected in >= 70% of samples in at least one biological group
-filter_proteins_by_group <- function(mat, metadata, group_col = "Combined_treatment", min_completeness = 0.70) {
+filter_proteins_by_group <- function(mat, metadata, group_col = "Group", min_completeness = 0.70) {
   groups <- unique(metadata[[group_col]])
   keep_proteins <- logical(nrow(mat))
   
@@ -383,9 +643,9 @@ filter_proteins_by_group <- function(mat, metadata, group_col = "Combined_treatm
 }
 
 mat_filtered <- filter_proteins_by_group(
-  mat = mat_active,
-  metadata = meta_active,
-  group_col = "Combined_treatment",
+  mat = mat_qc,
+  metadata = meta_qc,
+  group_col = "Group",
   min_completeness = PARAM_MIN_COMPLETENESS
 )
 
@@ -476,17 +736,10 @@ cat(sprintf("Imputation complete (%s). Total NA values remaining: %d\n",
 pca_fit <- prcomp(t(mat_imputed), scale. = FALSE)
 var_pct <- round((pca_fit$sdev^2 / sum(pca_fit$sdev^2)) * 100, 1)
 
-df_pca_plot <- cbind(as.data.frame(pca_fit$x[, 1:4]), meta_active)
+df_pca_plot <- cbind(as.data.frame(pca_fit$x[, 1:4]), meta_qc)
 
-p_pca <- ggplot(df_pca_plot, aes(x = PC1, y = PC2, color = Treatment, shape = Mutation)) +
+p_pca <- ggplot(df_pca_plot, aes(x = PC1, y = PC2, color = Group)) +
   geom_point(size = 3.5, alpha = 0.9) +
-  scale_shape_manual(values = c("WT" = 16, "AD" = 17)) +
-  scale_color_manual(values = c(
-    "CTRL"   = "#33a02c",
-    "UFP"    = "#e31a1c",
-    "AN"     = "#1f78b4",
-    "UFP_AN" = "#6a3d9a"
-  )) +
   theme_bw(base_size = 12) +
   theme(legend.position = "right") +
   labs(
@@ -494,9 +747,13 @@ p_pca <- ggplot(df_pca_plot, aes(x = PC1, y = PC2, color = Treatment, shape = Mu
     subtitle = "Normalized & Imputed Data Matrix",
     x = sprintf("PC1 (%s%% explained variance)", var_pct[1]),
     y = sprintf("PC2 (%s%% explained variance)", var_pct[2]),
-    color = "Exposure",
-    shape = "Genotype"
+    color = PARAM_GROUP_COL
   )
+
+# Add optional shape aesthetic if blocking factor is defined
+if (!is.null(PARAM_BLOCK_COL) && PARAM_BLOCK_COL %in% colnames(df_pca_plot)) {
+  p_pca <- p_pca + aes(shape = .data[[PARAM_BLOCK_COL]]) + labs(shape = PARAM_BLOCK_COL)
+}
 
 print(p_pca)
 ```
@@ -512,32 +769,48 @@ print(p_pca)
 
 final_proteins <- rownames(mat_imputed)
 
-if (file.exists(FILE_PEPTIDES)) {
+if (!is.null(FILE_PEPTIDES) && file.exists(FILE_PEPTIDES)) {
   pep_raw <- read.delim(FILE_PEPTIDES, sep = "\t", check.names = FALSE, stringsAsFactors = FALSE)
   id_col_pep <- colnames(pep_raw)[1]
   rownames(pep_raw) <- pep_raw[[id_col_pep]]
   
-  colnames(pep_raw) <- colnames(pep_raw) |>
+  # Standardize column headers matching sample names
+  clean_pep_cols <- colnames(pep_raw) |>
+    sub(pattern = "^\\[[0-9]+\\]\\s*", replacement = "") |>
+    sub(pattern = "\\.(raw|mzML|d).*", replacement = "") |>
     sub(pattern = ".*ASK_", replacement = "") |>
-    sub(pattern = "\\.raw.*", replacement = "_peptides")
+    sub(pattern = "(_peptides|_precursors)$", replacement = "")
   
-  target_pep_cols  <- paste(meta_active$Sample_Name, "peptides", sep = "_")
-  matched_pep_cols <- intersect(target_pep_cols, colnames(pep_raw))
+  colnames(pep_raw) <- clean_pep_cols
+  matched_pep_cols <- intersect(meta_qc$Sample_Name, colnames(pep_raw))
+  
+  if (length(matched_pep_cols) == 0) {
+    target_pep_cols  <- paste(meta_qc$Sample_Name, "peptides", sep = "_")
+    matched_pep_cols <- intersect(target_pep_cols, colnames(pep_raw))
+  }
   
   if (length(matched_pep_cols) > 0) {
-    sub_pep <- pep_raw[final_proteins, matched_pep_cols, drop = FALSE]
+    matched_prots <- intersect(final_proteins, rownames(pep_raw))
+    sub_pep <- matrix(1, nrow = length(final_proteins), ncol = length(matched_pep_cols),
+                      dimnames = list(final_proteins, matched_pep_cols))
+    sub_pep[matched_prots, ] <- as.matrix(pep_raw[matched_prots, matched_pep_cols, drop = FALSE])
+    
+    # Calculate representative precursor/peptide count per protein (max observed across active samples)
     pep_counts <- apply(sub_pep, 1, max, na.rm = TRUE)
     pep_counts[is.na(pep_counts) | pep_counts < 1] <- 1
+    cat(sprintf("Peptide counts mapped for %d proteins from %d samples (Median = %.0f per protein).\n",
+                length(matched_prots), length(matched_pep_cols), median(pep_counts)))
   } else {
+    warning("Peptide count file loaded, but columns did not match sample names. Defaulting to equal weighting (count = 1).")
     pep_counts <- setNames(rep(1, length(final_proteins)), final_proteins)
   }
 } else {
-  warning("Peptide count file not found. Defaulting to equal weighting (count = 1).")
+  cat("Peptide count file not specified or found. Defaulting to equal weighting (count = 1; standard limma eBayes).\n")
   pep_counts <- setNames(rep(1, length(final_proteins)), final_proteins)
 }
 
 pep_counts <- pep_counts[final_proteins]
-cat(sprintf("Peptide counts mapped for %d proteins (Median = %.0f precursors per protein).\n",
+cat(sprintf("Peptide counts initialized for %d proteins (Median = %.0f precursors per protein).\n",
             length(pep_counts), median(pep_counts)))
 ```
 
@@ -551,47 +824,57 @@ We construct the design matrix for all experimental conditions, account for tech
 #| label: deqms-modeling
 
 # 1. Design Matrix
-design_mat <- model.matrix(~ 0 + Combined_treatment, data = meta_active)
-colnames(design_mat) <- levels(meta_active$Combined_treatment)
+# Ensure syntactically valid factor level names for limma makeContrasts
+group_levels <- make.names(levels(meta_qc$Group))
+levels(meta_qc$Group) <- group_levels
 
-# 2. Estimate Technical Replicate Correlation (Paired Runs)
-dup_corr <- duplicateCorrelation(
-  mat_imputed, 
-  design = design_mat, 
-  block = meta_active$Replicate
-)
+design_mat <- model.matrix(~ 0 + Group, data = meta_qc)
+colnames(design_mat) <- levels(meta_qc$Group)
 
-cat(sprintf("Consensus technical replicate correlation: %.3f\n", dup_corr$consensus.correlation))
+# 2. Estimate Technical Replicate Correlation (Paired Runs / Duplicates)
+use_blocks <- !is.null(PARAM_BLOCK_COL) && 
+              (PARAM_BLOCK_COL %in% colnames(meta_qc)) && 
+              any(duplicated(meta_qc[[PARAM_BLOCK_COL]]))
 
-# 3. Fit Linear Model with Block Correlation
-fit_lm <- lmFit(
-  mat_imputed, 
-  design = design_mat, 
-  block = meta_active$Replicate, 
-  correlation = dup_corr$consensus.correlation
-)
+if (use_blocks) {
+  dup_corr <- duplicateCorrelation(
+    mat_imputed, 
+    design = design_mat, 
+    block = meta_qc[[PARAM_BLOCK_COL]]
+  )
+  cat(sprintf("Consensus duplicate/paired correlation: %.3f\n", dup_corr$consensus.correlation))
+  
+  # 3. Fit Linear Model with Block Correlation
+  fit_lm <- lmFit(
+    mat_imputed, 
+    design = design_mat, 
+    block = meta_qc[[PARAM_BLOCK_COL]], 
+    correlation = dup_corr$consensus.correlation
+  )
+} else {
+  cat("No repeated blocking structure detected. Fitting standard limma model.\n")
+  fit_lm <- lmFit(mat_imputed, design = design_mat)
+}
 
 # 4. Construct Experimental Contrasts
-# Note: Adjust contrast formulas if grouping factor names differ
-contrast_matrix <- makeContrasts(
-  # WT Treatment Effects
-  WT_Effect_UFP    = Female_WT_UFP - Female_WT_CTRL,
-  WT_Effect_AN     = Female_WT_AN - Female_WT_CTRL,
-  WT_Effect_UFP_AN = Female_WT_UFP_AN - Female_WT_CTRL,
+# If PARAM_CONTRASTS is defined in Section 1, use it.
+# Otherwise, automatically generate all pairwise comparisons between group levels.
+if (!is.null(PARAM_CONTRASTS) && length(PARAM_CONTRASTS) > 0) {
+  contrast_formulas <- PARAM_CONTRASTS
+} else {
+  grps <- colnames(design_mat)
+  if (length(grps) >= 2) {
+    pw <- combn(grps, 2, simplify = FALSE)
+    contrast_formulas <- sapply(pw, function(p) paste0(p[2], " - ", p[1]))
+    names(contrast_formulas) <- sapply(pw, function(p) paste0(p[2], "_vs_", p[1]))
+  } else {
+    stop("At least two experimental groups are required to define differential contrasts.")
+  }
+}
 
-  # AD Treatment Effects
-  AD_Effect_UFP    = Female_AD_UFP - Female_AD_CTRL,
-  AD_Effect_AN     = Female_AD_AN - Female_AD_CTRL,
-  AD_Effect_UFP_AN = Female_AD_UFP_AN - Female_AD_CTRL,
-
-  # Genotype Effects
-  AD_vs_WT_CTRL    = Female_AD_CTRL - Female_WT_CTRL,
-  AD_vs_WT_UFP     = Female_AD_UFP - Female_WT_UFP,
-  AD_vs_WT_AN      = Female_AD_AN - Female_WT_AN,
-  AD_vs_WT_UFP_AN  = Female_AD_UFP_AN - Female_WT_UFP_AN,
-
-  levels = design_mat
-)
+contrast_matrix <- makeContrasts(contrasts = contrast_formulas, levels = design_mat)
+cat("Constructed contrasts for differential testing:\n")
+print(colnames(contrast_matrix))
 
 fit_contrasts <- contrasts.fit(fit_lm, contrast_matrix)
 
@@ -643,7 +926,7 @@ df_summary_hits <- tibble(
 print(df_summary_hits)
 ```
 
-## Volcano Plots for Primary Exposure Contrasts
+## Volcano Plots for Experimental Contrasts
 
 ```{r}
 #| label: fig-volcano-plots
@@ -702,10 +985,10 @@ addWorksheet(wb, "Summary_Hits")
 writeData(wb, "Summary_Hits", df_summary_hits)
 freezePane(wb, "Summary_Hits", firstRow = TRUE)
 
-# Sheet 2: Multivariate IAC Metrics
-addWorksheet(wb, "QC_Sample_Connectivity_IAC")
-writeData(wb, "QC_Sample_Connectivity_IAC", df_iac)
-freezePane(wb, "QC_Sample_Connectivity_IAC", firstRow = TRUE)
+# Sheet 2: Sample QC Filter Report & IAC
+addWorksheet(wb, "QC_Sample_Filter_Report")
+writeData(wb, "QC_Sample_Filter_Report", qc_res$qc_table)
+freezePane(wb, "QC_Sample_Filter_Report", firstRow = TRUE)
 
 # Sheets for Each Contrast
 for (cn in names(results_list)) {
