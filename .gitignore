@@ -1,0 +1,10 @@
+.Rproj.user
+.Rhistory
+.RData
+.vscode
+renv/library
+renv/python
+data/
+results/
+figures/
+!figures/.gitkeep  # Optional: if you want to track the empty folder but not content
